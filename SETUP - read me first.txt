@@ -31,5 +31,10 @@ Tracks Pokemon Center parcels from your Gmail and Royal Mail, with Discord alert
    - Updates: it checks for new versions every day and installs them itself
      (or press "Check for updates now"). Your settings are kept.
 
+PICTURES FROM A FRIEND
+   - If someone sends you their "My pictures" folder, put it inside this
+     app folder (next to the .bat) before the first start. The pictures are
+     added and matched to stages by name automatically.
+
 If something goes wrong, the launcher window stays open and shows why,
 and details are in error.log in this folder.
