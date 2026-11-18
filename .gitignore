@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+error.log
+parcels_debug.json
+address_debug.txt
+tracking_debug*
+*.previous.py
+*.download
+My pictures/
