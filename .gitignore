@@ -12,3 +12,8 @@ photos_sent.json
 photo_hold.json
 purchases.json
 purchases_debug.json
+photo_fetch.log
+photo_debug.*
+purchases_scan.log
+photo_test.*
+*.log

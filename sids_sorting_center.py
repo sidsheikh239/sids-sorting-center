@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.9"
+VERSION = "5.0"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -54,11 +54,13 @@ SUMMARY_FILE = DATA_DIR / "summary.json"   # when the last daily summary went ou
 PHOTOS_DIR = DATA_DIR / "Delivery photos"   # Royal Mail delivery photos, named <tracking>.png/.jpg
 PHOTOS_SENT_FILE = DATA_DIR / "photos_sent.json"   # photos already posted to Discord
 PHOTO_HOLD_FILE = DATA_DIR / "photo_hold.json"   # Delivered alerts waiting for their photo
-PHOTO_WAIT_HOURS = 0.25   # 15 min: then the Delivered alert goes without a photo (and no photo is sent later)
+PHOTO_WAIT_HOURS = 65 / 60   # Claude's hourly check fetches the photo; after 65 min the alert goes without one
+AUTO_FETCH = False   # the app opening Royal Mail itself: Royal Mail answers automated browsers with 'Access Denied'
+PHOTO_RETRY_MIN = (0, 5, 15, 30, 50)   # minutes after delivery when the app tries Royal Mail again
 PICS_DIR = DATA_DIR / "My pictures"   # your own pictures (Settings > Look & pictures)
 PIC_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
-# Royal Mail tracking numbers, e.g. FE827634825GB (2 letters, 9 digits, GB)
+# Royal Mail tracking numbers, e.g. AB123456789GB (2 letters, 9 digits, GB)
 TRACKING_RE = re.compile(r"\b([A-Z]{2}\d{9}GB)\b")
 # Whatever follows "Tracking Number:" (covers non-GB / other courier formats)
 LABEL_RE = re.compile(r"Tracking\s*(?:Number|No\.?|#)\s*:?\s*(?:<[^>]+>\s*)*([A-Z0-9]{8,30})", re.I)
@@ -554,7 +556,8 @@ NOT_STOCK = {"PayPal", "Deliveroo", "Uber Eats", "Uber", "Just Eat"}
 ORDER_SUBJECT_RE = re.compile(
     r"order (confirmation|confirmed|received|placed|receipt|summary)|thanks? (you )?for (your )?(order|purchase)|"
     r"your (order|purchase|receipt)|receipt for|we('ve| have) (got|received) your order|order #|order no|"
-    r"payment (received|confirmation)|you('ve| have) (bought|paid|ordered)|purchase confirmation|invoice", re.I)
+    r"payment (received|confirmation)|you('ve| have) (bought|paid|ordered)|purchase confirmation|invoice|^ordered:|"
+    r"order (is )?confirmed|your .{0,30}order", re.I)
 NOT_ORDER_SUBJECT_RE = re.compile(
     r"(dispatched|despatched|shipped|on its way|out for delivery|delivered|arriving|tracking|refund|return|"
     r"cancel|review|rate your|feedback|survey|sale|% off|offer|newsletter|password|sign.?in|verify|security)", re.I)
@@ -565,6 +568,11 @@ TOTAL_RES = [
     re.compile(r"(?<!sub)(?<!sub-)\btotal\b[^£\n]{0,30}" + MONEY_RE, re.I),
 ]
 ORDER_NO_RE = re.compile(r"order\s*(?:number|no\.?|#|id|ref(?:erence)?)?\s*[:#]?\s*#?\s*([A-Z0-9][A-Z0-9\-]{4,24})", re.I)
+PARSER_VERSION = 2   # bump to re-read stored orders you haven't edited
+NOT_ITEM_RE = re.compile(r"(?i)^(external|free|visa|mastercard|amex|american express|paypal|apple pay|google pay|klarna|"
+                         r"clearpay|items?|item\(s\)|products?|description|price|qty|quantity|each|unit|card|"
+                         r"standard|express|click ?& ?collect|home delivery|collection|in stock|"
+                         r"pre.?order.*|expected.*|enjoy .*|•.*|\*.*)$")
 SKIP_LINE_RE = re.compile(r"total|subtotal|delivery|shipping|postage|vat|discount|saving|saved|paid|payment|"
                           r"refund|voucher|gift card|promo|tax|fee|balance|points|reward|credit", re.I)
 
@@ -645,7 +653,9 @@ def parse_purchase_email(sender: str, subject: str, body: str, date_iso: str) ->
                 if len(re.sub(r"[^A-Za-z]", "", cand)) >= 4 and len(cand) <= 160:
                     name = cand
                     break
-        if not name or len(name) > 160 or re.search(r"(?i)^(price|item|qty|quantity|each|unit)$", name):
+        name = name.strip(" •*-:")
+        if not name or len(name) > 160 or NOT_ITEM_RE.match(name) or name.lower() == store.lower() \
+                or re.search(r"(?i)re-?saleable|condition|returns?|terms|policy|@|www\.|https?:", name):
             continue
         q = re.search(r"(?i)(?:qty|quantity)\s*[:x]?\s*(\d+)|\b(\d+)\s*[x×]\s|[x×]\s*(\d+)\b", " ".join(lines[max(0, i - 2):i + 2]))
         qty = int(next(g for g in q.groups() if g)) if q else 1
@@ -681,12 +691,17 @@ def fetch_purchase_emails(host: str, user: str, password: str, since_days: int, 
         ids = set()
         gmail = any(b"X-GM-EXT-1" in (c if isinstance(c, bytes) else str(c).encode()) for c in M.capabilities)
         if gmail:
-            q = (f'(category:purchases OR subject:(order OR receipt OR purchase OR invoice)) '
-                 f'-subject:(dispatched OR shipped OR delivered OR "on its way") newer_than:{since_days}d')
-            typ, data = M.search(None, "X-GM-RAW", f'"{q}"')
-            if typ == "OK" and data and data[0]:
-                ids.update(data[0].split())
-        else:
+            # no double quotes inside: the whole query is sent as one quoted IMAP string
+            for q in (f"category:purchases newer_than:{since_days}d",
+                      f"subject:(order OR receipt OR purchase OR invoice) newer_than:{since_days}d"):
+                try:
+                    typ, data = M.search(None, "X-GM-RAW", f'"{q}"')
+                    if typ == "OK" and data and data[0]:
+                        ids.update(data[0].split())
+                except imaplib.IMAP4.error as e:
+                    log(f"Purchases: Gmail search failed ({e}), using a plain search")
+                    gmail = False
+        if not gmail:
             for word in ("order", "receipt", "purchase"):
                 try:
                     typ, data = M.search(None, "SINCE", since, "SUBJECT", f'"{word}"')
@@ -695,8 +710,16 @@ def fetch_purchase_emails(host: str, user: str, password: str, since_days: int, 
                 except imaplib.IMAP4.error:
                     pass
         log(f"Purchases: {len(ids)} possible order emails in the last {since_days} days")
-        for mid in sorted(ids, key=int):
-            typ, data = M.fetch(mid, "(BODY.PEEK[])")
+        # newest first; headers only to start with, so only order-looking emails are downloaded
+        for mid in sorted(ids, key=int, reverse=True)[:3000]:
+            typ, data = M.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
+            if typ != "OK" or not data or not isinstance(data[0], tuple):
+                continue
+            head = email.message_from_bytes(data[0][1])
+            subj = _decode(head.get("Subject"))
+            if not ORDER_SUBJECT_RE.search(subj) or NOT_ORDER_SUBJECT_RE.search(subj):
+                continue
+            typ, data = M.fetch(mid, "(BODY.PEEK[]<0.400000>)")   # first 400 KB is plenty (skips big attachments)
             if typ != "OK" or not data or not isinstance(data[0], tuple):
                 continue
             msg = email.message_from_bytes(data[0][1])
@@ -716,10 +739,14 @@ def scan_purchases(cfg: dict, log=lambda msg: None) -> tuple[int, int]:
     """Read order emails and merge them into purchases.json. Your own edits are kept. Returns (new, total)."""
     data = load_json(PURCHASES_FILE, {})
     meta = data.setdefault("_meta", {})
+    reparse = meta.get("parser") != PARSER_VERSION
+    if reparse:
+        meta.pop("scanned", None)   # read the whole year again with the better reader
     days = PURCHASE_DAYS if meta.get("scanned") else PURCHASE_DAYS_FIRST
     orders = data.setdefault("orders", {})
     debug = []
     new = 0
+    seen = set()
     for sender, subject, body, date_iso, msg_id in fetch_purchase_emails(cfg["imap_host"], cfg["email"], cfg["password"], days, log):
         p = parse_purchase_email(sender, subject, body, date_iso)
         debug.append({"from": sender, "subject": subject, "date": date_iso, "parsed": p,
@@ -727,19 +754,29 @@ def scan_purchases(cfg: dict, log=lambda msg: None) -> tuple[int, int]:
         if not p:
             continue
         k = purchase_key(p, msg_id)
+        if k in seen and k in orders and not orders[k].get("edited"):   # same order, several emails: keep the fullest
+            if len(p["items"]) > len(orders[k].get("items", [])):
+                orders[k]["items"] = p["items"]
+            continue
         old = orders.get(k)
         if old is None:
             orders[k] = p
             new += 1
+            if new % 10 == 0:   # save as it goes, so orders show up while a long first scan runs
+                save_json(PURCHASES_FILE, data)
+        elif not old.get("edited") and reparse and k not in seen:
+            orders[k] = p
         elif not old.get("edited"):
             if p["total"] and not old.get("total"):
                 old["total"] = p["total"]
             if len(p["items"]) > len(old.get("items", [])) and not any(it.get("market") for it in old.get("items", [])):
                 old["items"] = p["items"]
+        seen.add(k)
     meta["scanned"] = now_iso()
+    meta["parser"] = PARSER_VERSION
     save_json(PURCHASES_FILE, data)
     try:
-        save_json(Path(__file__).with_name("purchases_debug.json"), debug[-150:])
+        save_json(Path(__file__).with_name("purchases_debug.json"), debug[:250])
     except Exception:
         pass
     return new, len(orders)
@@ -1277,17 +1314,127 @@ def send_delivered_with_photo(webhook: str, title: str, parcel, detail: str, cou
 
 
 def send_delivered_no_photo(webhook: str, title: str, parcel, detail: str, counts: dict, cfg: dict) -> None:
-    """The Delivered alert when no photo was found within 15 minutes."""
+    """The Delivered alert when no photo could be found."""
     payload = _discord_payload(title, parcel, detail, counts, cfg, ping=True)
     fields = payload["embeds"][0]["fields"]
     for f in fields:
         if f["name"] == "📸 Delivery photo":
-            f["value"] = "❌ Couldn't find a delivery photo on Royal Mail within 15 minutes."
+            f["value"] = "❌ No delivery photo found on Royal Mail."
             break
     else:
         fields.append({"name": "📸 Delivery photo", "inline": False,
-                       "value": "❌ Couldn't find a delivery photo on Royal Mail within 15 minutes."})
+                       "value": "❌ No delivery photo found on Royal Mail."})
     post_webhook(webhook, payload, discord_picture(parcel.stage, cfg))
+
+
+PHOTO_LOG = Path(__file__).with_name("photo_fetch.log")
+
+
+def photo_log(msg: str) -> None:
+    try:
+        with open(PHOTO_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except OSError:
+        pass
+
+
+def ensure_playwright() -> bool:
+    """Playwright drives Microsoft Edge to open Royal Mail's page. Installed into the app's own .venv once."""
+    try:
+        import playwright.sync_api  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    import subprocess
+    import importlib
+    py = Path(sys.executable).with_name("python.exe")
+    if not py.exists():
+        py = Path(sys.executable)
+    photo_log("Installing Playwright (one time, about a minute)...")
+    try:
+        r = subprocess.run([str(py), "-m", "pip", "install", "--disable-pip-version-check", "playwright"],
+                           capture_output=True, text=True, timeout=900,
+                           creationflags=0x08000000 if os.name == "nt" else 0)
+        photo_log(f"pip finished ({r.returncode}) {r.stderr[-400:].strip()}")
+    except Exception as e:
+        photo_log(f"pip failed: {e}")
+    importlib.invalidate_caches()
+    try:
+        import playwright.sync_api  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def fetch_rm_photo(tracking: str, postcode: str, dest: Path) -> str:
+    """Open the Royal Mail tracking page in Microsoft Edge (window kept off-screen), enter the postcode and
+    save the delivery photo, the same steps you'd do by hand. Returns ok / no-photo / not-delivered /
+    blocked / error: .... It never tries to get past a bot check: it stops and says 'blocked'."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser, last = None, None
+        for kw in ({"channel": "msedge"}, {"channel": "chrome"}, {}):
+            try:
+                browser = pw.chromium.launch(headless=False, args=["--window-position=-3000,-3000",
+                                                                   "--window-size=1100,900"], **kw)
+                break
+            except Exception as e:
+                last = e
+        if browser is None:
+            return f"error: no browser ({last})"
+        try:
+            page = browser.new_page(locale="en-GB")
+            page.goto(RM_TRACK_URL.format(tracking), timeout=60000)
+            try:
+                page.get_by_role("button", name="Decline all").first.click(timeout=10000)
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+
+            def bot_check():
+                try:   # keep a picture + text of what the page showed, for checking
+                    page.screenshot(path=str(Path(__file__).with_name("photo_debug.png")))
+                    Path(__file__).with_name("photo_debug.txt").write_text(
+                        page.title() + "\n\n" + page.inner_text("body")[:6000], encoding="utf-8")
+                except Exception:
+                    pass
+                t = (page.title() + " " + page.inner_text("body")[:1500]).lower()
+                return any(w in t for w in ("access denied", "are you a robot", "unusual traffic",
+                                            "verify you are human", "pardon our interruption", "request unsuccessful"))
+            try:
+                page.get_by_role("button", name="Get more details").click(timeout=30000)
+            except Exception:
+                if bot_check():
+                    return "blocked"
+                return "not-delivered" if "delivered" not in page.inner_text("body").lower() else "error: no details button"
+            page.get_by_role("button", name="Confirm postcode").click(timeout=15000)
+            page.locator("#postcode-input").press_sequentially(postcode, delay=90)
+            page.get_by_role("button", name="Verify").click()
+            img = page.locator("img.proof-of-delivery-image")
+            try:
+                img.wait_for(timeout=20000)
+            except Exception:
+                return "blocked" if bot_check() else "no-photo"
+            if tracking not in page.inner_text("main").replace(" ", ""):
+                return "error: page showed a different parcel"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(".part")
+            try:   # the photo itself, full size
+                data = img.evaluate("async i => { await i.decode(); const c = document.createElement('canvas');"
+                                    " c.width = i.naturalWidth; c.height = i.naturalHeight;"
+                                    " c.getContext('2d').drawImage(i, 0, 0); return c.toDataURL('image/jpeg', 0.92); }")
+                tmp.write_bytes(base64.b64decode(data.split(",", 1)[1]))
+            except Exception:   # otherwise a picture of it as shown, made full size first
+                img.evaluate("i => { i.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483647;"
+                             "width:' + i.naturalWidth + 'px;height:' + i.naturalHeight + 'px;max-width:none;max-height:none'; }")
+                img.screenshot(path=str(tmp), type="jpeg", quality=92)
+            tmp.replace(dest)
+            return "ok"
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def send_delivery_photo(webhook: str, parcel, photo) -> None:
@@ -1553,7 +1700,7 @@ class Tracker:
                 with self.lock:
                     self.held[p.tracking] = {"title": title, "detail": detail, "at": now_iso()}
                     save_json(PHOTO_HOLD_FILE, self.held)
-                self.notify("info", f"{p.tracking} delivered: Discord alert waits up to 15 min for the delivery photo.")
+                self.notify("info", f"{p.tracking} delivered: Discord alert waits for the delivery photo (up to 65 min).")
                 return True
             try:
                 send_discord(cfg.get("discord", ""), title, p, detail, self.counts(), cfg)
@@ -3021,11 +3168,20 @@ def run_gui():
         scan_btn.configure(text="⏳  Scanning…")
 
         def go():
+            def slog(m):
+                events.put(("info", m))
+                try:
+                    with open(Path(__file__).with_name("purchases_scan.log"), "a", encoding="utf-8") as f:
+                        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {m}\n")
+                except OSError:
+                    pass
             try:
-                new, total = scan_purchases(cfg, log=lambda m: events.put(("info", m)))
-                events.put(("info", f"Purchases: {new} new order{'s' if new != 1 else ''} found ({total} in total)."))
+                slog("Purchases: scanning your inbox (read-only)...")
+                new, total = scan_purchases(cfg, log=slog)
+                slog(f"Purchases: {new} new order{'s' if new != 1 else ''} found ({total} in total).")
             except Exception as e:
                 events.put(("error", f"Purchase scan failed: {e}"))
+                slog(f"FAILED: {e!r}")
             finally:
                 pur["busy"] = False
                 root.after(0, scan_done)
@@ -3749,7 +3905,7 @@ def run_gui():
         if not (cfg["rm_id"] and cfg["rm_secret"]):
             messagebox.showinfo(APP_NAME, "Paste your Royal Mail API client ID and secret first.")
             return
-        sample = next(iter(tracker.parcels), "FE827634825GB")
+        sample = next(iter(tracker.parcels), "AB123456789GB")
         try:
             res = royal_mail_status(sample, cfg["rm_id"], cfg["rm_secret"])
             messagebox.showinfo(APP_NAME, f"Royal Mail API works ✔\n\n{sample}: {res[1] if res else 'no scans found'}")
@@ -4093,6 +4249,69 @@ def run_gui():
     phone.update({"srv": None})
 
     photo_job = {"busy": False}
+    fetcher = {"busy": False, "tries": {}, "blocked": False}
+
+    def start_fetches(held):
+        """Fetch Royal Mail photos for held Delivered alerts, one parcel at a time, in the background."""
+        if fetcher["busy"] or fetcher["blocked"] or not AUTO_FETCH:
+            return
+        now = datetime.now(timezone.utc)
+        for t, h in held.items():
+            if delivery_photo_file(t):
+                continue
+            p = tracker.parcels.get(t)
+            pc = delivery_postcode(p) if p else ""
+            if not pc:
+                continue
+            try:
+                mins = (now - datetime.fromisoformat(h["at"])).total_seconds() / 60
+            except Exception:
+                mins = 0
+            done = fetcher["tries"].get(t, 0)
+            if done >= len(PHOTO_RETRY_MIN) or mins < PHOTO_RETRY_MIN[done]:
+                continue
+            fetcher["tries"][t] = done + 1
+            fetcher["busy"] = True
+
+            def go(t=t, pc=pc):
+                try:
+                    if not ensure_playwright():
+                        res = "error: Playwright could not be installed"
+                    else:
+                        res = fetch_rm_photo(t, pc, PHOTOS_DIR / f"{t}.jpg")
+                except Exception as e:
+                    res = f"error: {e}"
+                photo_log(f"{t} ({pc}) try {fetcher['tries'].get(t)}: {res}")
+                if res == "blocked":
+                    fetcher["blocked"] = True
+                    events.put(("error", "Royal Mail showed a bot check, so the app stopped fetching photos "
+                                         "(it won't try to get past it). Claude's hourly check carries on."))
+                elif res == "ok":
+                    events.put(("info", f"Got the delivery photo for {t}."))
+                fetcher["busy"] = False
+            threading.Thread(target=go, daemon=True).start()
+            return
+
+    def photo_test():
+        """A file 'photo_test.txt' (tracking postcode) next to the app runs one test fetch into photo_test.jpg."""
+        f = Path(__file__).with_name("photo_test.txt")
+        if f.exists() and not fetcher["busy"]:
+            try:
+                tr, pc = f.read_text().split(None, 1)
+                f.unlink()
+            except Exception:
+                return
+            fetcher["busy"] = True
+
+            def go():
+                try:
+                    res = fetch_rm_photo(tr.strip(), pc.strip(), Path(__file__).with_name("photo_test.jpg")) \
+                        if ensure_playwright() else "error: Playwright could not be installed"
+                except Exception as e:
+                    res = f"error: {e}"
+                photo_log(f"TEST {tr} ({pc.strip()}): {res}")
+                fetcher["busy"] = False
+            threading.Thread(target=go, daemon=True).start()
 
     def photo_timer():
         """Every minute: post any new delivery photo (in the Delivery photos folder) to Discord, once each."""
@@ -4103,6 +4322,7 @@ def run_gui():
                 todo = []
                 with tracker.lock:
                     held = dict(tracker.held)
+                start_fetches(held)
                 for t, h in held.items():
                     p = tracker.parcels.get(t)
                     f = delivery_photo_file(t)
@@ -4161,7 +4381,11 @@ def run_gui():
                     threading.Thread(target=go, daemon=True).start()
         except Exception as e:
             add_log("error", f"Delivery photos: {e}")
-        root.after(60_000, photo_timer)
+        try:
+            photo_test()
+        except Exception:
+            pass
+        root.after(30_000, photo_timer)
 
     def daily_backup():
         if settings.get("backups", True):
