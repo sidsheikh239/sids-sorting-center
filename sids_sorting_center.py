@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.5"
+VERSION = "4.6"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -1004,6 +1004,16 @@ def send_discord(webhook: str, title: str, parcel: Parcel, detail: str, counts: 
     post_webhook(webhook, payload, discord_picture(parcel.stage, cfg))
 
 
+def delivery_postcode(parcel) -> str:
+    pcs = POSTCODE_RE.findall((parcel.address or "").upper())
+    pc = (pcs[-1] if isinstance(pcs[-1], str) else pcs[-1][0]) if pcs else ""
+    pc = re.sub(r"\s+", "", pc)
+    return f"{pc[:-3]} {pc[-3:]}" if len(pc) > 4 else pc
+
+
+RM_TRACK_URL = "https://www.royalmail.com/track-your-item#/tracking-results/{}"
+
+
 def _discord_payload(title: str, parcel: Parcel, detail: str, counts: dict, cfg: dict, ping: bool) -> dict:
     embed = {
         "title": title,
@@ -1028,10 +1038,7 @@ def _discord_payload(title: str, parcel: Parcel, detail: str, counts: dict, cfg:
     if marks:
         embed["fields"].append({"name": "Your notes", "value": marks[:1000], "inline": False})
     if parcel.stage == "Delivered":
-        pcs = POSTCODE_RE.findall((parcel.address or "").upper())
-        pc = (pcs[-1] if isinstance(pcs[-1], str) else pcs[-1][0]) if pcs else ""
-        pc = re.sub(r"\s+", "", pc)
-        pc = f"{pc[:-3]} {pc[-3:]}" if len(pc) > 4 else pc
+        pc = delivery_postcode(parcel)
         embed["fields"].append({"name": "📸 Delivery photo", "inline": False, "value": (
             f"[Open on Royal Mail](https://www.royalmail.com/track-your-item#/tracking-results/{parcel.tracking})"
             + (f" · it asks for the postcode: **{pc}**" if pc else " · it asks for the delivery postcode")
@@ -2089,6 +2096,7 @@ def run_gui():
     rebook_row = tk.Frame(d_body, bg=PANEL)
     rebook_row.pack(side="bottom", fill="x", pady=(8, 0), before=d_btns)
     rebook_btn = button(rebook_row, "📮  Rebook missed delivery (copies the number)", STAGE_STYLE["Delivery attempted"][0], size=9, pady=6)
+    photo_btn = button(rebook_row, "📸  Delivery photo (copies the postcode)", STAGE_STYLE["Delivered"][0], size=9, pady=6)
 
     def draw_journey(stage):
         journey.delete("all")
@@ -2152,6 +2160,7 @@ def run_gui():
             pokeball(d_head, w - 34, 32, 20, top=ON if p else RED, outline=DEEP)
         if not p:
             rebook_btn.pack_forget()
+            photo_btn.pack_forget()
             d_head.create_text(18, 32, text="Pick a parcel", anchor="w", fill=ON, font=(FONT, 14, "bold"))
             for v in d_vars.values():
                 v.set("")
@@ -2176,6 +2185,10 @@ def run_gui():
                 rebook_btn.pack(side="left", fill="x", expand=True)
         else:
             rebook_btn.pack_forget()
+        if p.stage == "Delivered":
+            photo_btn.pack(side="left", fill="x", expand=True)
+        else:
+            photo_btn.pack_forget()
         d_vars["status"].set(status)
         root.after(10, lambda: draw_journey(p.stage))
         hist.delete("1.0", "end")
@@ -2212,6 +2225,18 @@ def run_gui():
             add_log("info", f"Copied {ref}. Paste it on the Royal Mail redelivery page.")
             webbrowser.open(REDELIVERY_URL)
 
+    def delivery_photo():
+        p = selected()
+        if p:
+            pc = delivery_postcode(p)
+            if pc:
+                root.clipboard_clear()
+                root.clipboard_append(pc)
+            add_log("info", f"Royal Mail asks for the delivery postcode{': ' + pc + ' (copied)' if pc else ''}. "
+                            "The photo only shows if the postie took one.")
+            webbrowser.open(RM_TRACK_URL.format(p.tracking))
+
+    photo_btn.configure(command=delivery_photo)
     rebook_btn.configure(command=rebook)
     open_btn.configure(command=open_tracking)
     copy_btn.configure(command=copy_number)
