@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.8"
+VERSION = "4.9"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -54,7 +54,7 @@ SUMMARY_FILE = DATA_DIR / "summary.json"   # when the last daily summary went ou
 PHOTOS_DIR = DATA_DIR / "Delivery photos"   # Royal Mail delivery photos, named <tracking>.png/.jpg
 PHOTOS_SENT_FILE = DATA_DIR / "photos_sent.json"   # photos already posted to Discord
 PHOTO_HOLD_FILE = DATA_DIR / "photo_hold.json"   # Delivered alerts waiting for their photo
-PHOTO_WAIT_HOURS = 3   # send the Delivered alert without a photo if none has arrived by then
+PHOTO_WAIT_HOURS = 0.25   # 15 min: then the Delivered alert goes without a photo (and no photo is sent later)
 PICS_DIR = DATA_DIR / "My pictures"   # your own pictures (Settings > Look & pictures)
 PIC_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
@@ -227,7 +227,7 @@ def backup_data(force: bool = False) -> Path | None:
     if dest.exists() and not force:
         return None
     dest.mkdir(parents=True, exist_ok=True)
-    for f in (STATE_FILE, ARCHIVE_FILE, SETTINGS_FILE, SUMMARY_FILE):
+    for f in (STATE_FILE, ARCHIVE_FILE, SETTINGS_FILE, SUMMARY_FILE, DATA_DIR / "purchases.json"):
         if f.exists():
             shutil.copy2(f, dest / f.name)
     olds = sorted(d for d in BACKUP_DIR.iterdir() if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name))
@@ -525,6 +525,239 @@ def fetch_pokemon_emails(host: str, user: str, password: str, since_days: int = 
             except Exception:
                 date_iso = now_iso()
             yield subject, message_html_and_text(msg), date_iso
+
+
+# --------------------------------------------------------------------------
+# Purchases from any store (order confirmation / receipt emails)
+# --------------------------------------------------------------------------
+
+PURCHASES_FILE = DATA_DIR / "purchases.json"
+PURCHASE_DAYS_FIRST = 365   # first scan looks back a year
+PURCHASE_DAYS = 21          # later scans look back three weeks
+
+STORE_NAMES = {
+    "pokemon.com": "Pokémon Center", "pokemoncenter.com": "Pokémon Center", "narvar.com": "Pokémon Center",
+    "amazon.co.uk": "Amazon", "amazon.com": "Amazon", "ebay.co.uk": "eBay", "ebay.com": "eBay",
+    "argos.co.uk": "Argos", "smythstoys.com": "Smyths Toys", "game.co.uk": "GAME", "zavvi.com": "Zavvi",
+    "johnlewis.co.uk": "John Lewis", "tesco.com": "Tesco", "asda.com": "Asda", "very.co.uk": "Very",
+    "currys.co.uk": "Currys", "magicmadhouse.co.uk": "Magic Madhouse", "chaoscards.co.uk": "Chaos Cards",
+    "totalcards.net": "Total Cards", "vinted.co.uk": "Vinted", "vinted.com": "Vinted", "cardmarket.com": "Cardmarket",
+    "hmv.com": "HMV", "whsmith.co.uk": "WHSmith", "theentertainer.com": "The Entertainer", "thetoyshop.com": "The Entertainer",
+    "selfridges.com": "Selfridges", "costco.co.uk": "Costco", "sainsburys.co.uk": "Sainsbury's", "boxed.gg": "Boxed",
+    "paypal.co.uk": "PayPal", "paypal.com": "PayPal", "tiktok.com": "TikTok Shop", "temu.com": "Temu",
+    "aliexpress.com": "AliExpress", "shein.com": "SHEIN", "asos.com": "ASOS", "nike.com": "Nike", "apple.com": "Apple",
+    "deliveroo.co.uk": "Deliveroo", "ubereats.com": "Uber Eats", "uber.com": "Uber", "justeat.co.uk": "Just Eat",
+}
+# PayPal / food / taxi receipts are payments, not stock: shown, but not counted as stock
+NOT_STOCK = {"PayPal", "Deliveroo", "Uber Eats", "Uber", "Just Eat"}
+
+ORDER_SUBJECT_RE = re.compile(
+    r"order (confirmation|confirmed|received|placed|receipt|summary)|thanks? (you )?for (your )?(order|purchase)|"
+    r"your (order|purchase|receipt)|receipt for|we('ve| have) (got|received) your order|order #|order no|"
+    r"payment (received|confirmation)|you('ve| have) (bought|paid|ordered)|purchase confirmation|invoice", re.I)
+NOT_ORDER_SUBJECT_RE = re.compile(
+    r"(dispatched|despatched|shipped|on its way|out for delivery|delivered|arriving|tracking|refund|return|"
+    r"cancel|review|rate your|feedback|survey|sale|% off|offer|newsletter|password|sign.?in|verify|security)", re.I)
+MONEY_RE = r"(?:£|GBP\s?)\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+\.\d{2})"
+TOTAL_RES = [
+    re.compile(r"(?:order total|grand total|total paid|amount paid|total charged|payment total|total to pay|"
+               r"total \(inc[^)]*\)|total incl[^:£]*|you paid|amount)\s*[:\-]?\s*" + MONEY_RE, re.I),
+    re.compile(r"(?<!sub)(?<!sub-)\btotal\b[^£\n]{0,30}" + MONEY_RE, re.I),
+]
+ORDER_NO_RE = re.compile(r"order\s*(?:number|no\.?|#|id|ref(?:erence)?)?\s*[:#]?\s*#?\s*([A-Z0-9][A-Z0-9\-]{4,24})", re.I)
+SKIP_LINE_RE = re.compile(r"total|subtotal|delivery|shipping|postage|vat|discount|saving|saved|paid|payment|"
+                          r"refund|voucher|gift card|promo|tax|fee|balance|points|reward|credit", re.I)
+
+
+def html_to_lines(body: str) -> list[str]:
+    """Rough text from an email body: block tags become new lines, entities decoded."""
+    from html import unescape
+    t = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", body)
+    t = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|h\d|table|td|th)>", "\n", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = unescape(t).replace("\xa0", " ")
+    out = []
+    for ln in t.splitlines():
+        ln = re.sub(r"[ \t‌​]+", " ", ln).strip()
+        if ln and (not out or out[-1] != ln):
+            out.append(ln)
+    return out
+
+
+def store_from_sender(sender: str) -> str:
+    from email.utils import parseaddr
+    name, addr = parseaddr(sender or "")
+    dom = addr.split("@")[-1].lower() if "@" in addr else ""
+    parts = dom.split(".")
+    for i in range(len(parts) - 1):
+        cand = ".".join(parts[i:])
+        if cand in STORE_NAMES:
+            return STORE_NAMES[cand]
+    name = re.sub(r"(?i)\b(no-?reply|orders?|customer ?service|team|uk|shop|store|notifications?|info|support)\b", "", name)
+    name = re.sub(r"[\"'<>|@]", "", name).strip(" -·:")
+    if len(name) >= 2:
+        return name[:40]
+    if len(parts) >= 2:
+        base = parts[-3] if parts[-2] in ("co", "com", "org", "net") and len(parts) >= 3 else parts[-2]
+        return base.capitalize()
+    return "Other"
+
+
+def _money(x: str) -> float:
+    try:
+        return float(x.replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def parse_purchase_email(sender: str, subject: str, body: str, date_iso: str) -> dict | None:
+    """Best-effort reading of an order confirmation: store, order number, total and the items."""
+    if not ORDER_SUBJECT_RE.search(subject or "") or NOT_ORDER_SUBJECT_RE.search(subject or ""):
+        return None
+    store = store_from_sender(sender)
+    lines = html_to_lines(body)
+    flat = "\n".join(lines)
+    total = 0.0
+    for rx in TOTAL_RES:
+        found = rx.findall(flat)
+        if found:
+            total = _money(found[-1])
+            break
+    order = ""
+    for m in ORDER_NO_RE.finditer(subject + "\n" + flat):
+        if re.search(r"\d", m[1]):
+            order = m[1].upper()
+            break
+    items = []
+    for i, ln in enumerate(lines):
+        if SKIP_LINE_RE.search(ln):
+            continue
+        m = re.search(MONEY_RE, ln)
+        if not m:
+            continue
+        name = ln[:m.start()].strip(" -:·|x×")
+        if len(re.sub(r"[^A-Za-z]", "", name)) < 4:   # price on its own line: name is a line or two above
+            name = ""
+            for j in range(i - 1, max(-1, i - 4), -1):
+                cand = lines[j]
+                if re.search(MONEY_RE, cand) or SKIP_LINE_RE.search(cand) or re.fullmatch(r"(?i)(qty|quantity)?[:\s]*\d+", cand):
+                    continue
+                if len(re.sub(r"[^A-Za-z]", "", cand)) >= 4 and len(cand) <= 160:
+                    name = cand
+                    break
+        if not name or len(name) > 160 or re.search(r"(?i)^(price|item|qty|quantity|each|unit)$", name):
+            continue
+        q = re.search(r"(?i)(?:qty|quantity)\s*[:x]?\s*(\d+)|\b(\d+)\s*[x×]\s|[x×]\s*(\d+)\b", " ".join(lines[max(0, i - 2):i + 2]))
+        qty = int(next(g for g in q.groups() if g)) if q else 1
+        price = _money(m[1])
+        if price <= 0 or (total and price > total + 0.01):
+            continue
+        if any(it["name"] == name for it in items):
+            continue
+        items.append({"name": name[:160], "qty": max(1, min(qty, 99)), "price": price, "market": None, "sold": []})
+    if not total and not items:
+        return None
+    if not total:
+        total = round(sum(it["price"] for it in items), 2)
+    return {"store": store, "order": order, "date": date_iso, "subject": subject[:200], "total": total,
+            "items": items[:30], "hidden": False, "edited": False}
+
+
+def fetch_purchase_emails(host: str, user: str, password: str, since_days: int, log=lambda msg: None):
+    """Yield (sender, subject, body, date_iso, message_id) for likely order emails. Read-only (BODY.PEEK)."""
+    since = datetime.fromtimestamp(time.time() - since_days * 86400).strftime("%d-%b-%Y")
+    with imaplib.IMAP4_SSL(host, 993, timeout=60) as M:
+        M.login(user, password)
+        chosen = None
+        for box in [b for b in (_find_all_mail(M), "INBOX") if b]:
+            try:
+                if M.select(box, readonly=True)[0] == "OK":
+                    chosen = box
+                    break
+            except imaplib.IMAP4.error:
+                pass
+        if not chosen:
+            raise RuntimeError("Couldn't open any mailbox folder")
+        ids = set()
+        gmail = any(b"X-GM-EXT-1" in (c if isinstance(c, bytes) else str(c).encode()) for c in M.capabilities)
+        if gmail:
+            q = (f'(category:purchases OR subject:(order OR receipt OR purchase OR invoice)) '
+                 f'-subject:(dispatched OR shipped OR delivered OR "on its way") newer_than:{since_days}d')
+            typ, data = M.search(None, "X-GM-RAW", f'"{q}"')
+            if typ == "OK" and data and data[0]:
+                ids.update(data[0].split())
+        else:
+            for word in ("order", "receipt", "purchase"):
+                try:
+                    typ, data = M.search(None, "SINCE", since, "SUBJECT", f'"{word}"')
+                    if typ == "OK" and data and data[0]:
+                        ids.update(data[0].split())
+                except imaplib.IMAP4.error:
+                    pass
+        log(f"Purchases: {len(ids)} possible order emails in the last {since_days} days")
+        for mid in sorted(ids, key=int):
+            typ, data = M.fetch(mid, "(BODY.PEEK[])")
+            if typ != "OK" or not data or not isinstance(data[0], tuple):
+                continue
+            msg = email.message_from_bytes(data[0][1])
+            try:
+                date_iso = parsedate_to_datetime(msg.get("Date")).astimezone(timezone.utc).isoformat(timespec="seconds")
+            except Exception:
+                date_iso = now_iso()
+            yield (_decode(msg.get("From")), _decode(msg.get("Subject")), message_html_and_text(msg), date_iso,
+                   (msg.get("Message-ID") or mid.decode()).strip())
+
+
+def purchase_key(p: dict, msg_id: str = "") -> str:
+    return f"{p['store']}|{p['order']}" if p.get("order") else f"{p['store']}|{msg_id or p['date']}"
+
+
+def scan_purchases(cfg: dict, log=lambda msg: None) -> tuple[int, int]:
+    """Read order emails and merge them into purchases.json. Your own edits are kept. Returns (new, total)."""
+    data = load_json(PURCHASES_FILE, {})
+    meta = data.setdefault("_meta", {})
+    days = PURCHASE_DAYS if meta.get("scanned") else PURCHASE_DAYS_FIRST
+    orders = data.setdefault("orders", {})
+    debug = []
+    new = 0
+    for sender, subject, body, date_iso, msg_id in fetch_purchase_emails(cfg["imap_host"], cfg["email"], cfg["password"], days, log):
+        p = parse_purchase_email(sender, subject, body, date_iso)
+        debug.append({"from": sender, "subject": subject, "date": date_iso, "parsed": p,
+                      "text": "\n".join(html_to_lines(body))[:2500]})
+        if not p:
+            continue
+        k = purchase_key(p, msg_id)
+        old = orders.get(k)
+        if old is None:
+            orders[k] = p
+            new += 1
+        elif not old.get("edited"):
+            if p["total"] and not old.get("total"):
+                old["total"] = p["total"]
+            if len(p["items"]) > len(old.get("items", [])) and not any(it.get("market") for it in old.get("items", [])):
+                old["items"] = p["items"]
+    meta["scanned"] = now_iso()
+    save_json(PURCHASES_FILE, data)
+    try:
+        save_json(Path(__file__).with_name("purchases_debug.json"), debug[-150:])
+    except Exception:
+        pass
+    return new, len(orders)
+
+
+def purchase_value(p: dict) -> tuple[float, float]:
+    """(cost of items with a market value, market value of those items)."""
+    cost = value = 0.0
+    for it in p.get("items", []):
+        if it.get("market") is not None:
+            cost += it.get("price", 0) * it.get("qty", 1)
+            value += it["market"] * it.get("qty", 1)
+    return cost, value
+
+
+EBAY_SOLD_URL = "https://www.ebay.co.uk/sch/i.html?_nkw={}&LH_Sold=1&LH_Complete=1&_sop=13"
+VINTED_URL = "https://www.vinted.co.uk/catalog?search_text={}"
+CARDMARKET_URL = "https://www.cardmarket.com/en/Pokemon/Products/Search?searchString={}"
 
 
 # --------------------------------------------------------------------------
@@ -1043,6 +1276,20 @@ def send_delivered_with_photo(webhook: str, title: str, parcel, detail: str, cou
     r.raise_for_status()
 
 
+def send_delivered_no_photo(webhook: str, title: str, parcel, detail: str, counts: dict, cfg: dict) -> None:
+    """The Delivered alert when no photo was found within 15 minutes."""
+    payload = _discord_payload(title, parcel, detail, counts, cfg, ping=True)
+    fields = payload["embeds"][0]["fields"]
+    for f in fields:
+        if f["name"] == "📸 Delivery photo":
+            f["value"] = "❌ Couldn't find a delivery photo on Royal Mail within 15 minutes."
+            break
+    else:
+        fields.append({"name": "📸 Delivery photo", "inline": False,
+                       "value": "❌ Couldn't find a delivery photo on Royal Mail within 15 minutes."})
+    post_webhook(webhook, payload, discord_picture(parcel.stage, cfg))
+
+
 def send_delivery_photo(webhook: str, parcel, photo) -> None:
     """A new Discord message with the delivery photo as a big picture."""
     data = photo.read_bytes()
@@ -1306,7 +1553,7 @@ class Tracker:
                 with self.lock:
                     self.held[p.tracking] = {"title": title, "detail": detail, "at": now_iso()}
                     save_json(PHOTO_HOLD_FILE, self.held)
-                self.notify("info", f"{p.tracking} delivered: Discord alert waits for the delivery photo (up to {PHOTO_WAIT_HOURS} h).")
+                self.notify("info", f"{p.tracking} delivered: Discord alert waits up to 15 min for the delivery photo.")
                 return True
             try:
                 send_discord(cfg.get("discord", ""), title, p, detail, self.counts(), cfg)
@@ -2414,6 +2661,406 @@ def run_gui():
 
     export_btn.configure(command=export_csv)
 
+    # ================= Purchases (every store) =================
+    pur_tab = tk.Frame(nb, bg=BG)
+    nb.add(pur_tab, text="  🛍  Purchases  ")
+    pur = {"data": load_json(PURCHASES_FILE, {}), "store": "All", "view": "orders", "busy": False, "sel": None}
+    p_bar = tk.Frame(pur_tab, bg=BG)
+    p_bar.pack(fill="x", padx=10, pady=(12, 4))
+    tk.Label(p_bar, text="Orders from every store in your inbox (read-only). Each store has its own section.",
+             bg=BG, fg=MUTED, font=(FONT, 10)).pack(side="left")
+    p_search = tk.StringVar()
+    p_box = tk.Frame(p_bar, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
+    p_box.pack(side="right")
+    tk.Label(p_box, text="🔍", bg=PANEL, fg=MUTED).pack(side="left", padx=(8, 0))
+    tk.Entry(p_box, textvariable=p_search, relief="flat", bg=PANEL, fg=TEXT, width=22, font=(FONT, 10),
+             insertbackground=TEXT).pack(side="left", ipady=6, padx=6)
+    p_view = tk.StringVar(value="orders")
+    for val, label in [("spending", "📈 Spending"), ("orders", "🧾 Orders")]:
+        tk.Radiobutton(p_bar, text=label, value=val, variable=p_view, indicatoron=0, relief="flat", bd=0,
+                       bg=PANEL, fg=TEXT, selectcolor=NEON, activebackground=RAISED, activeforeground=ON,
+                       font=(FONT, 9, "bold"), padx=10, pady=4, cursor="hand2", highlightthickness=1,
+                       highlightbackground=EDGE, command=lambda: switch_view()).pack(side="right", padx=2)
+    scan_btn = button(p_bar, "🔄  Scan inbox", RED, lambda: scan_inbox(True), size=9, pady=4)
+    scan_btn.pack(side="right", padx=10)
+
+    p_chips = tk.Frame(pur_tab, bg=BG)
+    p_chips.pack(fill="x", padx=10, pady=(2, 6))
+    p_cards = tk.Frame(pur_tab, bg=BG)
+    p_cards.pack(fill="x", padx=10, pady=(0, 8))
+    p_card_vars = {}
+    for key, title, colour in [("spent", "SPENT", NEON), ("orders", "ORDERS", "#4D7CFF"), ("month", "THIS MONTH", "#FF9F1C"),
+                               ("value", "STOCK VALUE (EBAY)", "#2BE38B"), ("profit", "PROFIT / LOSS", "#FF2E97")]:
+        f = tk.Frame(p_cards, bg=PANEL, highlightbackground=colour, highlightthickness=1)
+        f.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        v = tk.StringVar(value="—")
+        tk.Label(f, textvariable=v, bg=PANEL, fg=colour, font=(FONT, 17, "bold")).pack(anchor="w", padx=12, pady=(8, 0))
+        tk.Label(f, text=title, bg=PANEL, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w", padx=12, pady=(0, 8))
+        p_card_vars[key] = v
+
+    p_body = tk.Frame(pur_tab, bg=BG)
+    p_body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    # --- orders view
+    o_view = tk.Frame(p_body, bg=BG)
+    o_left = card(o_view)
+    o_left.pack(side="left", fill="both", expand=True)
+    o_cols = ("date", "store", "order", "items", "total", "value")
+    o_table = ttk.Treeview(o_left, columns=o_cols, show="headings", selectmode="browse")
+    for c, w, t, st in [("date", 92, "DATE", False), ("store", 130, "STORE", False), ("order", 130, "ORDER", False),
+                        ("items", 330, "ITEMS", True), ("total", 80, "TOTAL", False), ("value", 90, "EBAY VALUE", False)]:
+        o_table.heading(c, text=t, anchor="w")
+        o_table.column(c, width=w, anchor="w", stretch=st)
+    o_sb = ttk.Scrollbar(o_left, orient="vertical", command=o_table.yview)
+    o_table.configure(yscrollcommand=o_sb.set)
+    o_sb.pack(side="right", fill="y")
+    o_table.pack(fill="both", expand=True)
+    o_empty = tk.Label(o_left, text="No orders yet. Press  🔄 Scan inbox  to look for them.", bg=PANEL, fg=MUTED, font=(FONT, 11))
+
+    o_right = card(o_view)
+    o_right.pack(side="right", fill="y", padx=(10, 0))
+    o_right.configure(width=400)
+    o_title = tk.StringVar(value="Pick an order")
+    o_sub = tk.StringVar(value="")
+    tk.Label(o_right, textvariable=o_title, bg=PANEL, fg=ON, font=(FONT, 13, "bold"), anchor="w", wraplength=380,
+             justify="left").pack(fill="x", padx=12, pady=(10, 0))
+    tk.Label(o_right, textvariable=o_sub, bg=PANEL, fg=MUTED, font=(FONT, 9), anchor="w", wraplength=380,
+             justify="left").pack(fill="x", padx=12)
+    tot_row = tk.Frame(o_right, bg=PANEL)
+    tot_row.pack(fill="x", padx=12, pady=6)
+    tk.Label(tot_row, text="Total £", bg=PANEL, fg=TEXT, font=(FONT, 9, "bold")).pack(side="left")
+    o_total = tk.StringVar()
+    tot_entry = ttk.Entry(tot_row, textvariable=o_total, width=10, font=(FONT, 9))
+    tot_entry.pack(side="left", padx=4)
+    it_cols = ("item", "qty", "price", "market")
+    it_table = ttk.Treeview(o_right, columns=it_cols, show="headings", selectmode="browse", height=8)
+    for c, w, t in [("item", 200, "ITEM"), ("qty", 36, "QTY"), ("price", 64, "PAID"), ("market", 72, "EBAY AVG")]:
+        it_table.heading(c, text=t, anchor="w")
+        it_table.column(c, width=w, anchor="w", stretch=(c == "item"))
+    it_table.pack(fill="both", expand=True, padx=12)
+    mk_row = tk.Frame(o_right, bg=PANEL)
+    mk_row.pack(fill="x", padx=12, pady=(6, 0))
+    tk.Label(mk_row, text="eBay value £ (each)", bg=PANEL, fg=TEXT, font=(FONT, 9, "bold")).pack(side="left")
+    o_market = tk.StringVar()
+    mk_entry = ttk.Entry(mk_row, textvariable=o_market, width=9, font=(FONT, 9))
+    mk_entry.pack(side="left", padx=4)
+    o_sold = tk.StringVar(value="")
+    tk.Label(o_right, textvariable=o_sold, bg=PANEL, fg=MUTED, font=(FONT, 8), anchor="w", wraplength=380,
+             justify="left").pack(fill="x", padx=12)
+    link_row = tk.Frame(o_right, bg=PANEL)
+    link_row.pack(fill="x", padx=12, pady=6)
+    o_btns = tk.Frame(o_right, bg=PANEL)
+    o_btns.pack(fill="x", padx=12, pady=(0, 10))
+
+    def money(x):
+        return f"£{x:,.2f}"
+
+    def orders():
+        return pur["data"].get("orders", {})
+
+    def visible_orders():
+        q = p_search.get().strip().lower()
+        out = []
+        for k, o in orders().items():
+            if o.get("hidden"):
+                continue
+            if pur["store"] != "All" and o.get("store") != pur["store"]:
+                continue
+            if q and q not in (o.get("store", "") + " " + o.get("order", "") + " " + o.get("subject", "") + " " +
+                               " ".join(it["name"] for it in o.get("items", []))).lower():
+                continue
+            out.append((k, o))
+        out.sort(key=lambda kv: kv[1].get("date", ""), reverse=True)
+        return out
+
+    def save_purchases():
+        save_json(PURCHASES_FILE, pur["data"])
+
+    def build_chips():
+        for w in p_chips.winfo_children():
+            w.destroy()
+        counts = {}
+        for o in orders().values():
+            if not o.get("hidden"):
+                counts[o.get("store", "Other")] = counts.get(o.get("store", "Other"), 0) + 1
+        names = ["All"] + sorted(counts, key=lambda s: (s != "Pokémon Center", -counts[s], s))
+        for s in names:
+            n = sum(counts.values()) if s == "All" else counts[s]
+            on = pur["store"] == s
+            b = tk.Label(p_chips, text=f"{'🃏 ' if s == 'Pokémon Center' else ''}{s}  {n}", bg=NEON if on else PANEL,
+                         fg=DEEP if on else TEXT, font=(FONT, 9, "bold"), padx=10, pady=4, cursor="hand2",
+                         highlightthickness=1, highlightbackground=EDGE)
+            b.pack(side="left", padx=(0, 6))
+            b.bind("<Button-1>", lambda e, s=s: (pur.update(store=s), refresh_purchases()))
+
+    def refresh_purchases(*_):
+        build_chips()
+        rows = visible_orders()
+        o_table.delete(*o_table.get_children())
+        spent = month = cost = value = 0.0
+        this_month = datetime.now().strftime("%Y-%m")
+        for k, o in rows:
+            items = o.get("items", [])
+            c, v = purchase_value(o)
+            cost += c
+            value += v
+            spent += o.get("total", 0) or 0
+            if local_month(o.get("date", "")) == this_month:
+                month += o.get("total", 0) or 0
+            names = ", ".join(f"{it['qty']}× {it['name']}" if it.get("qty", 1) > 1 else it["name"] for it in items) \
+                or o.get("subject", "")
+            o_table.insert("", "end", iid=k, values=(local_day(o.get("date", "")), o.get("store", ""), o.get("order", "") or "—",
+                                                     names, money(o.get("total", 0) or 0), money(v) if v else "—"))
+        if rows:
+            o_empty.place_forget()
+        else:
+            o_empty.place(relx=0.5, rely=0.4, anchor="center")
+        p_card_vars["spent"].set(money(spent))
+        p_card_vars["orders"].set(str(len(rows)))
+        p_card_vars["month"].set(money(month))
+        p_card_vars["value"].set(money(value) if value else "—")
+        p_card_vars["profit"].set((("+" if value >= cost else "−") + money(abs(value - cost))) if value else "—")
+        if pur["sel"] in dict(rows):
+            o_table.selection_set(pur["sel"])
+        if pur["view"] == "spending":
+            draw_spending(rows)
+
+    def local_day(iso):
+        try:
+            return datetime.fromisoformat(iso).astimezone().strftime("%d %b %Y")
+        except Exception:
+            return ""
+
+    def local_month(iso):
+        try:
+            return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m")
+        except Exception:
+            return ""
+
+    def show_order(*_):
+        sel = o_table.selection()
+        for w in link_row.winfo_children() + o_btns.winfo_children():
+            w.destroy()
+        it_table.delete(*it_table.get_children())
+        o_market.set("")
+        o_sold.set("")
+        if not sel:
+            return
+        pur["sel"] = sel[0]
+        o = orders().get(sel[0])
+        if not o:
+            return
+        o_title.set(f"{o.get('store', '')} · {o.get('order') or 'order'}")
+        o_sub.set(f"{local_day(o.get('date', ''))}\n{o.get('subject', '')}")
+        o_total.set(f"{o.get('total', 0):.2f}")
+        for i, it in enumerate(o.get("items", [])):
+            it_table.insert("", "end", iid=str(i), values=(it["name"], it.get("qty", 1), money(it.get("price", 0)),
+                                                         money(it["market"]) if it.get("market") is not None else "—"))
+        if o.get("items"):
+            it_table.selection_set("0")
+        button(o_btns, "Save", "#2BE38B", save_order, size=9, pady=4).pack(side="left")
+        button(o_btns, "＋ Item", "#4D7CFF", add_item, size=9, pady=4).pack(side="left", padx=6)
+        button(o_btns, "🙈 Not a purchase", "#555B75", hide_order, size=9, pady=4).pack(side="right")
+
+    def show_item(*_):
+        for w in link_row.winfo_children():
+            w.destroy()
+        o = orders().get(pur["sel"] or "")
+        sel = it_table.selection()
+        if not o or not sel:
+            return
+        it = o["items"][int(sel[0])]
+        o_market.set("" if it.get("market") is None else f"{it['market']:.2f}")
+        sold = it.get("sold") or []
+        o_sold.set(("Last sold on eBay: " + ", ".join(money(x) for x in sold) +
+                    (f"  (checked {local_day(it.get('checked', ''))})" if it.get("checked") else "")) if sold else "")
+        from urllib.parse import quote_plus
+        q = quote_plus(it["name"][:80])
+        for label, url, colour in [("eBay sold", EBAY_SOLD_URL, "#E53238"), ("Vinted", VINTED_URL, "#09B1BA"),
+                                   ("Cardmarket", CARDMARKET_URL, "#1F5BA8")]:
+            button(link_row, label, colour, lambda u=url.format(q): webbrowser.open(u), size=8, pady=3).pack(side="left", padx=(0, 6))
+
+    def save_order(*_):
+        o = orders().get(pur["sel"] or "")
+        if not o:
+            return
+        try:
+            o["total"] = round(float(o_total.get().replace("£", "").replace(",", "")), 2)
+        except ValueError:
+            pass
+        sel = it_table.selection()
+        if sel:
+            it = o["items"][int(sel[0])]
+            txt = o_market.get().replace("£", "").replace(",", "").strip()
+            try:
+                it["market"] = round(float(txt), 2) if txt else None
+            except ValueError:
+                pass
+        o["edited"] = True
+        save_purchases()
+        keep = sel[0] if sel else None
+        refresh_purchases()
+        show_order()
+        if keep and it_table.exists(keep):
+            it_table.selection_set(keep)
+
+    def add_item():
+        from tkinter import simpledialog
+        o = orders().get(pur["sel"] or "")
+        if not o:
+            return
+        name = simpledialog.askstring(APP_NAME, "Item name:", parent=root)
+        if not name:
+            return
+        price = simpledialog.askfloat(APP_NAME, "Price paid each (£):", parent=root, minvalue=0) or 0.0
+        qty = simpledialog.askinteger(APP_NAME, "Quantity:", parent=root, minvalue=1, initialvalue=1) or 1
+        o.setdefault("items", []).append({"name": name.strip(), "qty": qty, "price": price, "market": None, "sold": []})
+        o["edited"] = True
+        save_purchases()
+        refresh_purchases()
+        show_order()
+
+    def hide_order():
+        o = orders().get(pur["sel"] or "")
+        if o:
+            o["hidden"] = True
+            o["edited"] = True
+            save_purchases()
+            pur["sel"] = None
+            refresh_purchases()
+            show_order()
+
+    o_table.bind("<<TreeviewSelect>>", show_order)
+    it_table.bind("<<TreeviewSelect>>", show_item)
+    mk_entry.bind("<Return>", save_order)
+    tot_entry.bind("<Return>", save_order)
+    p_search.trace_add("write", refresh_purchases)
+
+    # --- spending view
+    s_view = card(p_body)
+    s_canvas = tk.Canvas(s_view, bg=PANEL, highlightthickness=0)
+    s_canvas.pack(fill="both", expand=True)
+    s_canvas.bind("<Configure>", lambda e: pur["view"] == "spending" and draw_spending(visible_orders()))
+    STORE_COLOURS = ["#FF2E97", "#00E5FF", "#FFC300", "#2BE38B", "#B36BFF", "#FF9F1C", "#4D7CFF", "#FF5D5D"]
+
+    def draw_spending(rows):
+        c = s_canvas
+        c.delete("all")
+        w, h = max(c.winfo_width(), 600), max(c.winfo_height(), 300)
+        now = datetime.now()
+        months = []
+        y, m = now.year, now.month
+        for _ in range(12):
+            months.append(f"{y}-{m:02d}")
+            m -= 1
+            if m == 0:
+                y, m = y - 1, 12
+        months.reverse()
+        per_month = {k: 0.0 for k in months}
+        per_store = {}
+        for _, o in rows:
+            t = o.get("total", 0) or 0
+            mm = local_month(o.get("date", ""))
+            if mm in per_month:
+                per_month[mm] += t
+            per_store[o.get("store", "Other")] = per_store.get(o.get("store", "Other"), 0) + t
+        # monthly bars (left 60%)
+        lw = int(w * 0.6)
+        c.create_text(20, 18, text="Spent per month (last 12 months)", anchor="w", fill=ON, font=(FONT, 11, "bold"))
+        top = max(per_month.values() or [0]) or 1
+        bw = (lw - 60) / 12
+        base = h - 40
+        for i, k in enumerate(months):
+            v = per_month[k]
+            x0 = 40 + i * bw + 4
+            bh = (base - 60) * v / top
+            c.create_rectangle(x0, base - bh, x0 + bw - 8, base, fill=NEON if k != months[-1] else "#FF9F1C", outline="")
+            if v:
+                c.create_text(x0 + (bw - 8) / 2, base - bh - 8, text=f"£{v:,.0f}", fill=TEXT, font=(FONT, 8))
+            c.create_text(x0 + (bw - 8) / 2, base + 12, text=datetime.strptime(k, "%Y-%m").strftime("%b"), fill=MUTED,
+                          font=(FONT, 8))
+        # per store (right 40%)
+        x = lw + 20
+        c.create_text(x, 18, text="Spent per store", anchor="w", fill=ON, font=(FONT, 11, "bold"))
+        stores = sorted(per_store.items(), key=lambda kv: -kv[1])[:10]
+        top = (stores[0][1] if stores else 0) or 1
+        total = sum(per_store.values()) or 1
+        for i, (s, v) in enumerate(stores):
+            yy = 46 + i * 30
+            bl = (w - x - 170) * v / top
+            col = STORE_COLOURS[i % len(STORE_COLOURS)]
+            c.create_text(x, yy, text=s[:18], anchor="w", fill=TEXT, font=(FONT, 9, "bold"))
+            c.create_rectangle(x + 120, yy - 8, x + 120 + max(bl, 2), yy + 8, fill=col, outline="")
+            c.create_text(x + 126 + max(bl, 2), yy, text=f"£{v:,.0f}  ({v / total:.0%})", anchor="w", fill=MUTED,
+                          font=(FONT, 8))
+        if rows:
+            avg = sum(o.get("total", 0) or 0 for _, o in rows) / len(rows)
+            c.create_text(x, h - 20, text=f"{len(rows)} orders · average {money(avg)} per order", anchor="w",
+                          fill=MUTED, font=(FONT, 9))
+
+    def switch_view():
+        pur["view"] = p_view.get()
+        if pur["view"] == "spending":
+            o_view.pack_forget()
+            s_view.pack(fill="both", expand=True)
+            root.after(50, lambda: draw_spending(visible_orders()))
+        else:
+            s_view.pack_forget()
+            o_view.pack(fill="both", expand=True)
+
+    o_view.pack(fill="both", expand=True)
+
+    def scan_inbox(manual=False):
+        if pur["busy"]:
+            return
+        cfg = current_cfg()
+        if not (cfg["email"] and cfg["password"]):
+            if manual:
+                messagebox.showinfo(APP_NAME, "Add your email and app password in Settings first.")
+            return
+        pur["busy"] = True
+        scan_btn.configure(text="⏳  Scanning…")
+
+        def go():
+            try:
+                new, total = scan_purchases(cfg, log=lambda m: events.put(("info", m)))
+                events.put(("info", f"Purchases: {new} new order{'s' if new != 1 else ''} found ({total} in total)."))
+            except Exception as e:
+                events.put(("error", f"Purchase scan failed: {e}"))
+            finally:
+                pur["busy"] = False
+                root.after(0, scan_done)
+        threading.Thread(target=go, daemon=True).start()
+
+    def scan_done():
+        scan_btn.configure(text="🔄  Scan inbox")
+        pur["data"] = load_json(PURCHASES_FILE, {})
+        refresh_purchases()
+
+    def purchases_timer():
+        """Scan for new orders at start and every 6 hours."""
+        last = (pur["data"].get("_meta") or {}).get("scanned", "")
+        try:
+            due = not last or (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() > 6 * 3600
+        except Exception:
+            due = True
+        if due:
+            scan_inbox()
+        root.after(30 * 60_000, purchases_timer)
+
+    def purchases_file_watch():
+        """Pick up market values saved into purchases.json from outside the app."""
+        try:
+            mt = PURCHASES_FILE.stat().st_mtime if PURCHASES_FILE.exists() else 0
+            if pur.get("mt") is not None and mt != pur["mt"] and not pur["busy"]:
+                pur["data"] = load_json(PURCHASES_FILE, {})
+                refresh_purchases()
+            pur["mt"] = mt
+        except Exception:
+            pass
+        root.after(15_000, purchases_file_watch)
+
+    refresh_purchases()
+
     # ================= History =================
     hist_tab = tk.Frame(nb, bg=BG)
     nb.add(hist_tab, text="  📚  History  ")
@@ -2595,6 +3242,8 @@ def run_gui():
             refresh_logs()
         elif sel == str(stats_tab):
             refresh_stats()
+        elif sel == str(pur_tab):
+            refresh_purchases()
     nb.bind("<<NotebookTabChanged>>", on_tab)
 
     # ================= Settings =================
@@ -3486,7 +4135,7 @@ def run_gui():
                                     if h and f:
                                         send_delivered_with_photo(cfg["discord"], h["title"], parcel, h["detail"], tracker.counts(), cfg, f)
                                     elif h:
-                                        send_discord(cfg["discord"], h["title"], parcel, h["detail"], tracker.counts(), cfg)
+                                        send_delivered_no_photo(cfg["discord"], h["title"], parcel, h["detail"], tracker.counts(), cfg)
                                     else:
                                         send_delivery_photo(cfg["discord"], parcel, f)
                                 except Exception as e:
@@ -3496,9 +4145,11 @@ def run_gui():
                                     with tracker.lock:
                                         tracker.held.pop(parcel.tracking, None)
                                         save_json(PHOTO_HOLD_FILE, tracker.held)
-                                    if not f:
+                                    if not f:   # no photo: say so, and don't send one later
+                                        sent.add(parcel.tracking)
+                                        save_json(PHOTOS_SENT_FILE, sorted(sent))
                                         time.sleep(2.5)
-                                        continue   # the photo, if it comes later, is posted on its own
+                                        continue
                                 sent.add(parcel.tracking)
                                 save_json(PHOTOS_SENT_FILE, sorted(sent))
                                 done += 1
@@ -3562,6 +4213,8 @@ def run_gui():
     threading.Thread(target=mail_watch, daemon=True).start()
     root.after(20_000, daily_backup)
     root.after(25_000, photo_timer)
+    root.after(40_000, purchases_timer)
+    root.after(15_000, purchases_file_watch)
     if autostart or "--hidden" in sys.argv:
         if tray["icon"]:
             root.withdraw()
