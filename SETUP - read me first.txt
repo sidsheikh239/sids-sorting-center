@@ -23,6 +23,17 @@ Tracks Pokemon Center parcels from your Gmail and Royal Mail, with Discord alert
      New Webhook > Copy Webhook URL, paste it in. (Optional.)
    - Press "Test IMAP login", then Save. Tracking starts on its own.
 
+OUTLOOK / HOTMAIL USERS
+   Microsoft doesn't let apps log in to Outlook email with a password, so
+   send your Pokemon Center emails on to a Gmail and use that Gmail here:
+   1. Make a free Gmail (or use one you have) and its app password (step 4).
+   2. On outlook.com: Settings (gear) > Mail > Rules > + Add new rule.
+      Name: Pokemon Center. Condition: From contains pokemon.com
+      Add another rule the same way with: From contains narvar.com
+      Action: Redirect to > your Gmail address. Save.
+      (Use REDIRECT, not Forward, so the emails keep the Pokemon Center sender.)
+   3. In this app, enter the Gmail address and its app password.
+
 5. NICE EXTRAS (Settings)
    - "Create desktop & Start menu shortcut" for a Poke Ball shortcut.
    - "Start with Windows" so it runs in the background (system tray).
