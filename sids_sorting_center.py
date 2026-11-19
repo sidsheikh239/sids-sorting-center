@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.3"
+VERSION = "4.4"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -171,6 +171,18 @@ def import_pictures(settings: dict) -> int:
             s2["stage_pics"] = settings["stage_pics"]
             save_json(SETTINGS_FILE, s2)
     return added
+
+
+IMAP_SERVERS = {"gmail.com": "imap.gmail.com", "googlemail.com": "imap.gmail.com",
+                "outlook.com": "outlook.office365.com", "hotmail.com": "outlook.office365.com",
+                "hotmail.co.uk": "outlook.office365.com", "live.com": "outlook.office365.com",
+                "live.co.uk": "outlook.office365.com", "msn.com": "outlook.office365.com",
+                "yahoo.com": "imap.mail.yahoo.com", "yahoo.co.uk": "imap.mail.yahoo.com",
+                "icloud.com": "imap.mail.me.com", "me.com": "imap.mail.me.com", "aol.com": "imap.aol.com"}
+
+
+def imap_server_for(address: str) -> str:
+    return IMAP_SERVERS.get(address.strip().lower().rpartition("@")[2], "imap.gmail.com")
 
 
 def check_update() -> tuple[str, bytes] | None:
@@ -998,12 +1010,13 @@ def _discord_payload(title: str, parcel: Parcel, detail: str, counts: dict, cfg:
         "color": STAGE_COLOURS.get(parcel.stage, 0x999999),
         "fields": [
             {"name": "Tracking", "value": f"[{parcel.tracking}](https://www.royalmail.com/track-your-item#/tracking-results/{parcel.tracking})", "inline": True},
+            {"name": "📋 Copy", "value": f"```{parcel.tracking}```", "inline": True},
             {"name": "Stage", "value": nice_stage(parcel.stage), "inline": True},
             {"name": "Order", "value": parcel.order or "-", "inline": True},
             {"name": "Update", "value": detail[:1000] or "-", "inline": False},
         ],
         "footer": {"text": f"Shipped {counts['total']} · Awaiting scan {counts['waiting']} · At PC hub {counts['hub']} · "
-                           f"Moving {counts['moving']} · Delivered {counts['delivered']}"},
+                           f"Moving {counts['moving']} · Out for delivery {counts.get('ofd', 0)} · Delivered {counts['delivered']}"},
         "timestamp": now_iso(),
     }
     if parcel.name or parcel.address:
@@ -2497,10 +2510,18 @@ def run_gui():
         return f
 
     s_mail = section("Email (IMAP)", RED, "📧", "Where your Pokémon Center emails arrive. Read-only: nothing is moved or marked read.")
-    row(s_mail, "IMAP email", "email", settings.get("email", ""), hint="The Gmail address that gets your Pokémon Center emails")
+    row(s_mail, "IMAP email", "email", settings.get("email", ""), hint="The email address that gets your Pokémon Center emails")
     row(s_mail, "App password", "password", get_secret("imap_password"), show="•",
         hint="Google app password (myaccount.google.com/apppasswords). Saved in Windows Credential Manager.")
-    row(s_mail, "IMAP server", "imap_host", settings.get("imap_host", "imap.gmail.com"))
+    row(s_mail, "IMAP server", "imap_host", settings.get("imap_host", "imap.gmail.com"),
+        hint="Filled in for you from the email address (Gmail, Outlook/Hotmail, Yahoo, iCloud).")
+
+    def fill_server(*_):
+        addr = fields["email"].get()
+        known = set(IMAP_SERVERS.values())
+        if "@" in addr and (not fields["imap_host"].get().strip() or fields["imap_host"].get().strip() in known):
+            fields["imap_host"].set(imap_server_for(addr))
+    fields["email"].trace_add("write", fill_server)
     row(s_mail, "Check every (minutes)", "interval", str(settings.get("interval", 20)))
     mail_btns = btn_row(s_mail)
 
@@ -2836,7 +2857,7 @@ def run_gui():
         return {
             "email": fields["email"].get().strip(),
             "password": fields["password"].get().replace(" ", "").strip(),
-            "imap_host": fields["imap_host"].get().strip() or "imap.gmail.com",
+            "imap_host": fields["imap_host"].get().strip() or imap_server_for(fields["email"].get()),
             "interval": interval,
             "discord": fields["discord"].get().strip(),
             "rm_id": fields["rm_id"].get().strip(),
