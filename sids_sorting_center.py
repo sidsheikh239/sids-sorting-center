@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "5.1"
+VERSION = "5.2"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -3244,7 +3244,8 @@ def run_gui():
 
     def purchases_timer():
         """Scan for new orders at start and every 6 hours."""
-        last = (pur["data"].get("_meta") or {}).get("scanned", "")
+        meta = pur["data"].get("_meta") or {}
+        last = meta.get("scanned", "") if meta.get("parser") == PARSER_VERSION else ""   # better reader: read again now
         try:
             due = not last or (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() > 6 * 3600
         except Exception:
