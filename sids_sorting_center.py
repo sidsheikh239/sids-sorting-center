@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.7"
+VERSION = "4.8"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -53,6 +53,8 @@ ARCHIVE_FILE = DATA_DIR / "history.json"   # parcels older than KEEP_DAYS (kept 
 SUMMARY_FILE = DATA_DIR / "summary.json"   # when the last daily summary went out
 PHOTOS_DIR = DATA_DIR / "Delivery photos"   # Royal Mail delivery photos, named <tracking>.png/.jpg
 PHOTOS_SENT_FILE = DATA_DIR / "photos_sent.json"   # photos already posted to Discord
+PHOTO_HOLD_FILE = DATA_DIR / "photo_hold.json"   # Delivered alerts waiting for their photo
+PHOTO_WAIT_HOURS = 3   # send the Delivered alert without a photo if none has arrived by then
 PICS_DIR = DATA_DIR / "My pictures"   # your own pictures (Settings > Look & pictures)
 PIC_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
@@ -1026,6 +1028,21 @@ def delivery_photo_file(tracking: str):
     return None
 
 
+def send_delivered_with_photo(webhook: str, title: str, parcel, detail: str, counts: dict, cfg: dict, photo) -> None:
+    """The normal Delivered alert, with the delivery photo shown big underneath."""
+    payload = {"username": APP_NAME, **_discord_payload(title, parcel, detail, counts, cfg, ping=True)}
+    files = {}
+    pname = f"delivery{photo.suffix.lower()}"
+    files["files[0]"] = (pname, photo.read_bytes())
+    payload["embeds"][0]["image"] = {"url": f"attachment://{pname}"}
+    pic = discord_picture(parcel.stage, cfg)
+    if pic:
+        files["files[1]"] = pic
+        payload["embeds"][0]["thumbnail"] = {"url": f"attachment://{pic[0]}"}
+    r = requests.post(webhook, data={"payload_json": json.dumps(payload)}, files=files, timeout=30)
+    r.raise_for_status()
+
+
 def send_delivery_photo(webhook: str, parcel, photo) -> None:
     """A new Discord message with the delivery photo as a big picture."""
     data = photo.read_bytes()
@@ -1074,7 +1091,9 @@ def _discord_payload(title: str, parcel: Parcel, detail: str, counts: dict, cfg:
                                    parcel.note) if x)
     if marks:
         embed["fields"].append({"name": "Your notes", "value": marks[:1000], "inline": False})
-    if parcel.stage == "Delivered":
+    if parcel.stage == "Delivered" and delivery_photo_file(parcel.tracking):
+        embed["fields"].append({"name": "📸 Delivery photo", "inline": False, "value": "Below ⬇️"})
+    elif parcel.stage == "Delivered":
         pc = delivery_postcode(parcel)
         embed["fields"].append({"name": "📸 Delivery photo", "inline": False, "value": (
             f"[Open on Royal Mail](https://www.royalmail.com/track-your-item#/tracking-results/{parcel.tracking})"
@@ -1108,6 +1127,7 @@ class Tracker:
                 scan = "" if (p.rm_status or "").startswith("No Royal Mail") else (p.rm_status or "")
                 p.stage = stage_from_text(scan) if scan else "Shipped"
         self.quiet_once = False
+        self.held = load_json(PHOTO_HOLD_FILE, {})   # tracking -> {title, detail, at}
         for p in self.parcels.values():  # v2.0-2.3 misread the tracking page: start those parcels again
             bad = p.rm_status and ("Show Full History" in p.rm_status or p.rm_status.startswith("Tracking Number:")
                                    or re.match(r"(?i)today \d", p.rm_status))
@@ -1281,6 +1301,13 @@ class Tracker:
             nice = {"Shipped": "Awaiting scan", "Dispatched": "At Pokémon Center hub", "At mail centre": "At Royal Mail hub"}.get(stage, stage)
             title = f"📦 Parcel update: {nice}" if changed_stage or stage not in MOVING else "📍 Parcel moved"
             self.notify("alert", f"{title.split(' ', 1)[1]}\n{p.name or p.tracking}: {detail}")
+            if stage == "Delivered" and cfg.get("discord") and not delivery_photo_file(p.tracking):
+                # hold the Discord alert until the Royal Mail delivery photo is fetched (or PHOTO_WAIT_HOURS pass)
+                with self.lock:
+                    self.held[p.tracking] = {"title": title, "detail": detail, "at": now_iso()}
+                    save_json(PHOTO_HOLD_FILE, self.held)
+                self.notify("info", f"{p.tracking} delivered: Discord alert waits for the delivery photo (up to {PHOTO_WAIT_HOURS} h).")
+                return True
             try:
                 send_discord(cfg.get("discord", ""), title, p, detail, self.counts(), cfg)
             except Exception as e:
@@ -3422,27 +3449,56 @@ def run_gui():
         """Every minute: post any new delivery photo (in the Delivery photos folder) to Discord, once each."""
         try:
             cfg = current_cfg()
-            if cfg["discord"] and not photo_job["busy"] and PHOTOS_DIR.is_dir():
+            if cfg["discord"] and not photo_job["busy"]:
                 sent = set(load_json(PHOTOS_SENT_FILE, []))
                 todo = []
-                for f in sorted(PHOTOS_DIR.iterdir()):
-                    t = f.stem.upper()
-                    if f.suffix.lower() in PHOTO_TYPES and t not in sent and t in tracker.parcels:
-                        todo.append((tracker.parcels[t], f))
+                with tracker.lock:
+                    held = dict(tracker.held)
+                for t, h in held.items():
+                    p = tracker.parcels.get(t)
+                    f = delivery_photo_file(t)
+                    try:
+                        waited = (datetime.now(timezone.utc) - datetime.fromisoformat(h["at"])).total_seconds() / 3600
+                    except Exception:
+                        waited = PHOTO_WAIT_HOURS
+                    if p is None or f or waited >= PHOTO_WAIT_HOURS:
+                        todo.append((p, f, h))
+                if PHOTOS_DIR.is_dir():
+                    for f in sorted(PHOTOS_DIR.iterdir()):
+                        t = f.stem.upper()
+                        if f.suffix.lower() in PHOTO_TYPES and t not in sent and t in tracker.parcels and t not in held:
+                            todo.append((tracker.parcels[t], f, None))
                 if todo:
                     photo_job["busy"] = True
 
                     def go():
                         done = 0
                         try:
-                            for parcel, f in todo:
+                            for parcel, f, h in todo:
                                 if quitting.is_set():
                                     break
+                                if parcel is None:   # parcel gone: just drop the hold
+                                    with tracker.lock:
+                                        tracker.held = {k: v for k, v in tracker.held.items() if v is not h}
+                                        save_json(PHOTO_HOLD_FILE, tracker.held)
+                                    continue
                                 try:
-                                    send_delivery_photo(cfg["discord"], parcel, f)
+                                    if h and f:
+                                        send_delivered_with_photo(cfg["discord"], h["title"], parcel, h["detail"], tracker.counts(), cfg, f)
+                                    elif h:
+                                        send_discord(cfg["discord"], h["title"], parcel, h["detail"], tracker.counts(), cfg)
+                                    else:
+                                        send_delivery_photo(cfg["discord"], parcel, f)
                                 except Exception as e:
-                                    events.put(("error", f"Delivery photo for {parcel.tracking} not sent: {e}"))
+                                    events.put(("error", f"Delivery alert/photo for {parcel.tracking} not sent: {e}"))
                                     break
+                                if h:
+                                    with tracker.lock:
+                                        tracker.held.pop(parcel.tracking, None)
+                                        save_json(PHOTO_HOLD_FILE, tracker.held)
+                                    if not f:
+                                        time.sleep(2.5)
+                                        continue   # the photo, if it comes later, is posted on its own
                                 sent.add(parcel.tracking)
                                 save_json(PHOTOS_SENT_FILE, sorted(sent))
                                 done += 1
