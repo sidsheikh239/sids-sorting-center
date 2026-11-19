@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.4"
+VERSION = "4.5"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -1851,7 +1851,8 @@ def run_gui():
             status_pill.configure(bg=RAISED, fg=MUTED)
         for w_ in pulse_edges:
             try:
-                w_.configure(highlightbackground=blend("#1B355E", NEON, 0.15 + 0.35 * g))
+                sel = int(w_.cget("highlightthickness")) > 1   # the counter you clicked stays lit
+                w_.configure(highlightbackground=NEON if sel else blend("#1B355E", NEON, 0.15 + 0.35 * g))
             except tk.TclError:
                 pass
         p = current.get("p")
@@ -1880,6 +1881,7 @@ def run_gui():
     stats = tk.Frame(dash, bg=BG)
     stats.pack(fill="x", padx=4, pady=(12, 6))
     stat_vars = {}
+    card_widgets = {}
     stat_defs = [("total", "Orders shipped", "📦", RED),
                  ("waiting", "Awaiting first scan", "⏳", STAGE_STYLE["Shipped"][0]),
                  ("hub", "At Pokémon Center hub", "🏬", STAGE_STYLE["Dispatched"][0]),
@@ -1903,6 +1905,11 @@ def run_gui():
         tk.Label(txt, textvariable=v, bg=PANEL, fg=colour,
                  font=(FONT, 15 if key == "last" else 26, "bold")).pack(anchor="w")
         tk.Label(txt, text=label.upper(), bg=PANEL, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w")
+        if key != "last":
+            card_widgets[key] = c
+            for w in [c, inner, txt, *inner.winfo_children(), *txt.winfo_children()]:
+                w.configure(cursor="hand2")
+                w.bind("<Button-1>", lambda e, k=key: card_click(k))
 
     # ---- Toolbar
     bar = tk.Frame(dash, bg=BG)
@@ -1944,8 +1951,26 @@ def run_gui():
     chips.pack(fill="x", padx=10, pady=(2, 8))
     chip_widgets = {}
 
+    # The big counters at the top work as filters too (click again to show everything)
+    CARD_FILTERS = {"moving": lambda p: p.stage in MOVING,
+                    "ofd": lambda p: p.stage in ("Out for delivery", "Delivery attempted"),
+                    "delivered": lambda p: p.done}
+    card_filter = {"total": "All", "waiting": "Shipped", "hub": "Dispatched", "moving": "moving",
+                   "ofd": "ofd", "delivered": "delivered"}
+
+    def card_click(key):
+        want = card_filter[key]
+        set_filter("All" if filter_var.get() == want else want)
+        nb.select(dash)
+
+    def show_card_selection():
+        for key, c in card_widgets.items():
+            on = filter_var.get() == card_filter[key] and key != "total"
+            c.configure(highlightbackground=NEON if on else "#22406E", highlightthickness=2 if on else 1)
+
     def set_filter(name):
         filter_var.set(name)
+        show_card_selection()
         for n, w in chip_widgets.items():
             colour = STAGE_STYLE.get(n, ("#D62828" if n == "Stuck" else NEON,))[0]
             on = n == name
@@ -2209,6 +2234,9 @@ def run_gui():
             stuck = is_stuck(p, settings.get("stuck_days", 3))
             if f == "Stuck":
                 if not stuck:
+                    continue
+            elif f in CARD_FILTERS:
+                if not CARD_FILTERS[f](p):
                     continue
             elif f != "All" and p.stage != f:
                 continue
