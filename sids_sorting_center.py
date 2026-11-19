@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "5.0"
+VERSION = "5.1"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -557,24 +557,48 @@ ORDER_SUBJECT_RE = re.compile(
     r"order (confirmation|confirmed|received|placed|receipt|summary)|thanks? (you )?for (your )?(order|purchase)|"
     r"your (order|purchase|receipt)|receipt for|we('ve| have) (got|received) your order|order #|order no|"
     r"payment (received|confirmation)|you('ve| have) (bought|paid|ordered)|purchase confirmation|invoice|^ordered:|"
-    r"order (is )?confirmed|your .{0,30}order", re.I)
+    r"order (is )?confirmed|your .{0,30}order|plac(ing|ed) an? (pre-?)?order", re.I)
 NOT_ORDER_SUBJECT_RE = re.compile(
     r"(dispatched|despatched|shipped|on its way|out for delivery|delivered|arriving|tracking|refund|return|"
-    r"cancel|review|rate your|feedback|survey|sale|% off|offer|newsletter|password|sign.?in|verify|security)", re.I)
+    r"cancel|review|rate your|feedback|survey|sale|% off|\boff\b|offer|newsletter|password|sign.?in|verify|security|"
+    r"on the way|with royal mail|ready to collect|taking .{0,20}longer|delay|estimate|update|important information)", re.I)
+CANCEL_SUBJECT_RE = re.compile(r"(order|item).{0,40}(has been |was )?cancel+ed|cancel+ation", re.I)
 MONEY_RE = r"(?:£|GBP\s?)\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+\.\d{2})"
 TOTAL_RES = [
     re.compile(r"(?:order total|grand total|total paid|amount paid|total charged|payment total|total to pay|"
-               r"total \(inc[^)]*\)|total incl[^:£]*|you paid|amount)\s*[:\-]?\s*" + MONEY_RE, re.I),
-    re.compile(r"(?<!sub)(?<!sub-)\btotal\b[^£\n]{0,30}" + MONEY_RE, re.I),
+               r"total \(inc[^)]*\)|total incl(?!udes)[^:£]*|you paid|amount)\s*[:\-]?\s*" + MONEY_RE, re.I),
+    re.compile(r"(?<!sub)(?<!sub-)\btotal\b(?! includes)[^£\n]{0,30}\n?\s*" + MONEY_RE, re.I),
 ]
 ORDER_NO_RE = re.compile(r"order\s*(?:number|no\.?|#|id|ref(?:erence)?)?\s*[:#]?\s*#?\s*([A-Z0-9][A-Z0-9\-]{4,24})", re.I)
-PARSER_VERSION = 2   # bump to re-read stored orders you haven't edited
+PARSER_VERSION = 3   # bump to re-read stored orders you haven't edited
 NOT_ITEM_RE = re.compile(r"(?i)^(external|free|visa|mastercard|amex|american express|paypal|apple pay|google pay|klarna|"
-                         r"clearpay|items?|item\(s\)|products?|description|price|qty|quantity|each|unit|card|"
+                         r"clearpay|amount|total|items?|item\(s\)|products?|description|price|qty|quantity|each|unit|card|"
                          r"standard|express|click ?& ?collect|home delivery|collection|in stock|"
                          r"pre.?order.*|expected.*|enjoy .*|•.*|\*.*)$")
-SKIP_LINE_RE = re.compile(r"total|subtotal|delivery|shipping|postage|vat|discount|saving|saved|paid|payment|"
-                          r"refund|voucher|gift card|promo|tax|fee|balance|points|reward|credit", re.I)
+LABEL_LINE_RE = re.compile(r"(?i)^(sku|qty|quantity|price|unit price|tax|vat|size|colou?r|item ?#|product code|ean|style|"
+                           r"variant|edition|sold by|dispatched by|seller)\b.{0,40}$")
+PRICE_LABEL_RE = re.compile(r"(?i)^(price|unit price|item price|cost|amount|each)?\s*[:\-]?$")
+SKIP_LINE_RE = re.compile(r"\b(total|subtotal|sub-total|delivery|shipping|postage|vat|discounts?|saving|saved|paid|payment|"
+                          r"refund|voucher|gift card|promo( code)?|tax|fees?|balance|points|rewards?|credit)\b", re.I)
+
+
+def _skip_line(ln: str) -> bool:
+    """A totals / delivery / payment line (short), not an item that happens to say e.g. 'Promo'."""
+    if re.search(r"(?i)\b(order total|total|sub-?total|vat|delivery charge|shipping|postage|payment)\b", ln) and \
+            not re.search(r"(?i)\b(box|pack|tin|collection|bundle|booster|figure|plush)\b", ln):
+        return True
+    return bool(SKIP_LINE_RE.search(ln)) and len(re.sub(MONEY_RE, "", ln).strip()) < 40
+
+
+def _qty_window(lines: list[str], i: int) -> list[str]:
+    """The lines that belong to the item priced on line i: back to the previous price, forward to the next."""
+    lo = i
+    while lo > max(0, i - 6) and not re.search(MONEY_RE, lines[lo - 1]):
+        lo -= 1
+    hi = i + 1
+    while hi < min(len(lines), i + 3) and not re.search(MONEY_RE, lines[hi]):
+        hi += 1
+    return lines[lo:hi]
 
 
 def html_to_lines(body: str) -> list[str]:
@@ -623,7 +647,7 @@ def parse_purchase_email(sender: str, subject: str, body: str, date_iso: str) ->
     if not ORDER_SUBJECT_RE.search(subject or "") or NOT_ORDER_SUBJECT_RE.search(subject or ""):
         return None
     store = store_from_sender(sender)
-    lines = html_to_lines(body)
+    lines = [re.sub(r"(?i)\b(\d{1,3}(?:,\d{3})*\.\d{2})\s?GBP\b", r"£\1", ln) for ln in html_to_lines(body)]
     flat = "\n".join(lines)
     total = 0.0
     for rx in TOTAL_RES:
@@ -636,19 +660,33 @@ def parse_purchase_email(sender: str, subject: str, body: str, date_iso: str) ->
         if re.search(r"\d", m[1]):
             order = m[1].upper()
             break
+    if not order:   # "Order Number:" on its own line, the number a line or two below
+        for i, ln in enumerate(lines):
+            if re.fullmatch(r"(?i)order (number|no\.?|#|id|ref(erence)?)\s*:?", ln):
+                for cand in lines[i + 1:i + 4]:
+                    mm = re.fullmatch(r"#?\s*([A-Z0-9][A-Z0-9\-]{4,24})", cand.strip(), re.I)
+                    if mm and re.search(r"\d", mm[1]):
+                        order = mm[1].upper()
+                        break
+                if order:
+                    break
     items = []
     for i, ln in enumerate(lines):
-        if SKIP_LINE_RE.search(ln):
+        if _skip_line(ln):
             continue
         m = re.search(MONEY_RE, ln)
         if not m:
             continue
         name = ln[:m.start()].strip(" -:·|x×")
+        if PRICE_LABEL_RE.match(name):
+            name = ""
+        if not name and i > 0 and _skip_line(lines[i - 1]) and len(lines[i - 1]) < 30:
+            continue   # e.g. "Tax" / "£5.00" on separate lines
         if len(re.sub(r"[^A-Za-z]", "", name)) < 4:   # price on its own line: name is a line or two above
             name = ""
-            for j in range(i - 1, max(-1, i - 4), -1):
+            for j in range(i - 1, max(-1, i - 8), -1):
                 cand = lines[j]
-                if re.search(MONEY_RE, cand) or SKIP_LINE_RE.search(cand) or re.fullmatch(r"(?i)(qty|quantity)?[:\s]*\d+", cand):
+                if re.search(MONEY_RE, cand) or _skip_line(cand) or LABEL_LINE_RE.match(cand) or re.fullmatch(r"[\d\s/:#x×-]*", cand):
                     continue
                 if len(re.sub(r"[^A-Za-z]", "", cand)) >= 4 and len(cand) <= 160:
                     name = cand
@@ -657,7 +695,7 @@ def parse_purchase_email(sender: str, subject: str, body: str, date_iso: str) ->
         if not name or len(name) > 160 or NOT_ITEM_RE.match(name) or name.lower() == store.lower() \
                 or re.search(r"(?i)re-?saleable|condition|returns?|terms|policy|@|www\.|https?:", name):
             continue
-        q = re.search(r"(?i)(?:qty|quantity)\s*[:x]?\s*(\d+)|\b(\d+)\s*[x×]\s|[x×]\s*(\d+)\b", " ".join(lines[max(0, i - 2):i + 2]))
+        q = re.search(r"(?i)(?:qty|quantity)\s*[:x]?\s*(\d+)|\b(\d+)\s*[x×]\s|(?<![A-Za-z0-9])(?-i:[x×])\s*(\d+)\b", " ".join(_qty_window(lines, i)))
         qty = int(next(g for g in q.groups() if g)) if q else 1
         price = _money(m[1])
         if price <= 0 or (total and price > total + 0.01):
@@ -717,7 +755,7 @@ def fetch_purchase_emails(host: str, user: str, password: str, since_days: int, 
                 continue
             head = email.message_from_bytes(data[0][1])
             subj = _decode(head.get("Subject"))
-            if not ORDER_SUBJECT_RE.search(subj) or NOT_ORDER_SUBJECT_RE.search(subj):
+            if not CANCEL_SUBJECT_RE.search(subj) and (not ORDER_SUBJECT_RE.search(subj) or NOT_ORDER_SUBJECT_RE.search(subj)):
                 continue
             typ, data = M.fetch(mid, "(BODY.PEEK[]<0.400000>)")   # first 400 KB is plenty (skips big attachments)
             if typ != "OK" or not data or not isinstance(data[0], tuple):
@@ -745,9 +783,13 @@ def scan_purchases(cfg: dict, log=lambda msg: None) -> tuple[int, int]:
     days = PURCHASE_DAYS if meta.get("scanned") else PURCHASE_DAYS_FIRST
     orders = data.setdefault("orders", {})
     debug = []
+    cancels = []
     new = 0
     seen = set()
     for sender, subject, body, date_iso, msg_id in fetch_purchase_emails(cfg["imap_host"], cfg["email"], cfg["password"], days, log):
+        if CANCEL_SUBJECT_RE.search(subject or ""):   # cancelled order: hide it so it isn't counted
+            cancels.append((store_from_sender(sender), subject + "\n" + "\n".join(html_to_lines(body))))
+            continue
         p = parse_purchase_email(sender, subject, body, date_iso)
         debug.append({"from": sender, "subject": subject, "date": date_iso, "parsed": p,
                       "text": "\n".join(html_to_lines(body))[:2500]})
@@ -765,6 +807,7 @@ def scan_purchases(cfg: dict, log=lambda msg: None) -> tuple[int, int]:
             if new % 10 == 0:   # save as it goes, so orders show up while a long first scan runs
                 save_json(PURCHASES_FILE, data)
         elif not old.get("edited") and reparse and k not in seen:
+            p["hidden"] = bool(old.get("hidden"))   # keep "Not a purchase"
             orders[k] = p
         elif not old.get("edited"):
             if p["total"] and not old.get("total"):
@@ -772,6 +815,13 @@ def scan_purchases(cfg: dict, log=lambda msg: None) -> tuple[int, int]:
             if len(p["items"]) > len(old.get("items", [])) and not any(it.get("market") for it in old.get("items", [])):
                 old["items"] = p["items"]
         seen.add(k)
+    for store, text in cancels:
+        for m in ORDER_NO_RE.finditer(text):
+            k = f"{store}|{m[1].upper()}"
+            if re.search(r"\d", m[1]) and k in orders and not orders[k].get("cancelled"):
+                orders[k]["cancelled"] = True
+                orders[k]["hidden"] = True
+                log(f"Purchases: {store} order {m[1].upper()} was cancelled, hidden")
     meta["scanned"] = now_iso()
     meta["parser"] = PARSER_VERSION
     save_json(PURCHASES_FILE, data)
