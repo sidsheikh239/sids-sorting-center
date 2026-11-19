@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     keyring = None
 
-VERSION = "4.6"
+VERSION = "4.7"
 KEEP_DAYS = 14  # only emails/parcels from the last 2 weeks onwards
 APP_NAME = "SID's Sorting Center"
 UPDATE_REPO = "sidsheikh239/sids-sorting-center"   # where "Check for updates" looks (public GitHub repo)
@@ -51,6 +51,8 @@ SETTINGS_FILE = DATA_DIR / "settings.json"   # non-secret settings only
 STATE_FILE = DATA_DIR / "parcels.json"
 ARCHIVE_FILE = DATA_DIR / "history.json"   # parcels older than KEEP_DAYS (kept for the History tab)
 SUMMARY_FILE = DATA_DIR / "summary.json"   # when the last daily summary went out
+PHOTOS_DIR = DATA_DIR / "Delivery photos"   # Royal Mail delivery photos, named <tracking>.png/.jpg
+PHOTOS_SENT_FILE = DATA_DIR / "photos_sent.json"   # photos already posted to Discord
 PICS_DIR = DATA_DIR / "My pictures"   # your own pictures (Settings > Look & pictures)
 PIC_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
@@ -1012,6 +1014,41 @@ def delivery_postcode(parcel) -> str:
 
 
 RM_TRACK_URL = "https://www.royalmail.com/track-your-item#/tracking-results/{}"
+PHOTO_TYPES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def delivery_photo_file(tracking: str):
+    """The saved delivery photo for this parcel, if there is one in the Delivery photos folder."""
+    for ext in PHOTO_TYPES:
+        f = PHOTOS_DIR / f"{tracking}{ext}"
+        if f.is_file():
+            return f
+    return None
+
+
+def send_delivery_photo(webhook: str, parcel, photo) -> None:
+    """A new Discord message with the delivery photo as a big picture."""
+    data = photo.read_bytes()
+    name = f"delivery{photo.suffix.lower()}"
+    when = next((h.get("at", "") for h in reversed(parcel.history) if h.get("stage") == "Delivered"), "")
+    embed = {
+        "title": f"📸 Delivery photo · {parcel.name or parcel.tracking}",
+        "color": STAGE_COLOURS.get("Delivered", 0x2ECC71),
+        "fields": [
+            {"name": "Tracking", "value": f"[{parcel.tracking}]({RM_TRACK_URL.format(parcel.tracking)})", "inline": True},
+            {"name": "📋 Copy", "value": f"```{parcel.tracking}```", "inline": True},
+            {"name": "Postcode", "value": delivery_postcode(parcel) or "—", "inline": True},
+        ],
+        "image": {"url": f"attachment://{name}"},
+    }
+    if parcel.order:
+        embed["fields"].append({"name": "Order", "value": parcel.order, "inline": True})
+    if when:
+        embed["footer"] = {"text": f"Delivered {local_time(when)}"}
+    payload = {"username": APP_NAME, "embeds": [embed]}
+    r = requests.post(webhook, data={"payload_json": json.dumps(payload)},
+                      files={"files[0]": (name, data)}, timeout=30)
+    r.raise_for_status()
 
 
 def _discord_payload(title: str, parcel: Parcel, detail: str, counts: dict, cfg: dict, ping: bool) -> dict:
@@ -2097,6 +2134,7 @@ def run_gui():
     rebook_row.pack(side="bottom", fill="x", pady=(8, 0), before=d_btns)
     rebook_btn = button(rebook_row, "📮  Rebook missed delivery (copies the number)", STAGE_STYLE["Delivery attempted"][0], size=9, pady=6)
     photo_btn = button(rebook_row, "📸  Delivery photo (copies the postcode)", STAGE_STYLE["Delivered"][0], size=9, pady=6)
+    photo_thumb = tk.Label(rebook_row, bg=PANEL, cursor="hand2", bd=0)
 
     def draw_journey(stage):
         journey.delete("all")
@@ -2185,7 +2223,17 @@ def run_gui():
                 rebook_btn.pack(side="left", fill="x", expand=True)
         else:
             rebook_btn.pack_forget()
+        photo_thumb.pack_forget()
         if p.stage == "Delivered":
+            pf = delivery_photo_file(p.tracking)
+            if pf:
+                thumb = picture_fit(str(pf), 96, 96)
+                if thumb:
+                    photo_thumb.configure(image=thumb)
+                    photo_thumb.pack(side="left", padx=(0, 8))
+                photo_btn.configure(text="📸  Open delivery photo")
+            else:
+                photo_btn.configure(text="📸  Delivery photo (copies the postcode)")
             photo_btn.pack(side="left", fill="x", expand=True)
         else:
             photo_btn.pack_forget()
@@ -2228,6 +2276,13 @@ def run_gui():
     def delivery_photo():
         p = selected()
         if p:
+            pf = delivery_photo_file(p.tracking)
+            if pf:
+                try:
+                    os.startfile(str(pf))
+                except Exception:
+                    webbrowser.open(pf.as_uri())
+                return
             pc = delivery_postcode(p)
             if pc:
                 root.clipboard_clear()
@@ -2237,6 +2292,7 @@ def run_gui():
             webbrowser.open(RM_TRACK_URL.format(p.tracking))
 
     photo_btn.configure(command=delivery_photo)
+    photo_thumb.bind("<Button-1>", lambda e: delivery_photo())
     rebook_btn.configure(command=rebook)
     open_btn.configure(command=open_tracking)
     copy_btn.configure(command=copy_number)
@@ -3360,6 +3416,46 @@ def run_gui():
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     phone.update({"srv": None})
 
+    photo_job = {"busy": False}
+
+    def photo_timer():
+        """Every minute: post any new delivery photo (in the Delivery photos folder) to Discord, once each."""
+        try:
+            cfg = current_cfg()
+            if cfg["discord"] and not photo_job["busy"] and PHOTOS_DIR.is_dir():
+                sent = set(load_json(PHOTOS_SENT_FILE, []))
+                todo = []
+                for f in sorted(PHOTOS_DIR.iterdir()):
+                    t = f.stem.upper()
+                    if f.suffix.lower() in PHOTO_TYPES and t not in sent and t in tracker.parcels:
+                        todo.append((tracker.parcels[t], f))
+                if todo:
+                    photo_job["busy"] = True
+
+                    def go():
+                        done = 0
+                        try:
+                            for parcel, f in todo:
+                                if quitting.is_set():
+                                    break
+                                try:
+                                    send_delivery_photo(cfg["discord"], parcel, f)
+                                except Exception as e:
+                                    events.put(("error", f"Delivery photo for {parcel.tracking} not sent: {e}"))
+                                    break
+                                sent.add(parcel.tracking)
+                                save_json(PHOTOS_SENT_FILE, sorted(sent))
+                                done += 1
+                                time.sleep(2.5)   # stay well under Discord's rate limit
+                        finally:
+                            photo_job["busy"] = False
+                            if done:
+                                events.put(("info", f"Sent {done} delivery photo{'s' if done != 1 else ''} to Discord."))
+                    threading.Thread(target=go, daemon=True).start()
+        except Exception as e:
+            add_log("error", f"Delivery photos: {e}")
+        root.after(60_000, photo_timer)
+
     def daily_backup():
         if settings.get("backups", True):
             try:
@@ -3409,6 +3505,7 @@ def run_gui():
     phone_server()
     threading.Thread(target=mail_watch, daemon=True).start()
     root.after(20_000, daily_backup)
+    root.after(25_000, photo_timer)
     if autostart or "--hidden" in sys.argv:
         if tray["icon"]:
             root.withdraw()

@@ -7,3 +7,5 @@ tracking_debug*
 *.previous.py
 *.download
 My pictures/
+Delivery photos/
+photos_sent.json
